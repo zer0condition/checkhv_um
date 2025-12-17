@@ -384,7 +384,7 @@ int main() {
     
     CheckSyntheticCPUID();
     CheckCrystalClock();
-    CheckERMSBEPT();
+    //CheckERMSBEPT();
 
     CheckUMIP_SGDT();
     CheckSchedulerSignature();
