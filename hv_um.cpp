@@ -41,17 +41,32 @@ void CheckSyntheticCPUID() {
 }
 
 void CheckCrystalClock() {
-    int cpuInfo[4] = { 0 };
-    __cpuid(cpuInfo, 0x15);
+    int leaf15[4] = { 0 };
+    int leaf16[4] = { 0 };
 
-    // many intel CPUs return partial info or require Leaf 0x16
-    if (cpuInfo[2] == 0) {
-        Log("CPUID.0x15", "no crystal freq (normal on many Intel CPUs)", false);
-        return;
+    __cpuid(leaf15, 0x15);
+    __cpuid(leaf16, 0x16);
+
+    bool has15 = (leaf15[2] != 0); // ECX = crystal freq if supported 
+    bool has16 = (leaf16[0] != 0); // EAX = base freq MHz if supported 
+
+    double official_hz = 0.0;
+
+    if (has15) {
+        // TSC freq = ECX * EBX / EAX
+        unsigned long long denom = leaf15[0] ? leaf15[0] : 1;
+        official_hz = (double)leaf15[2] * (double)leaf15[1] / (double)denom;
     }
-
-    unsigned long long denom = cpuInfo[0] ? cpuInfo[0] : 1;
-    double official = (double)cpuInfo[2] * cpuInfo[1] / denom;
+    else if (has16) {
+        // leaf 0x16: base frequency in MHz, not guaranteed == TSC
+        // but often very close on modern Intel, good enough as "nominal"
+        unsigned int base_mhz = (unsigned int)leaf16[0];
+        official_hz = (double)base_mhz * 1.0e6;
+    }
+    else {
+        // no CPUID based freq info at all fall back to consistency only mode
+        // we still measure TSC vs QPC but dont label it against an official value
+    }
 
     LARGE_INTEGER freq, t1, t2;
     QueryPerformanceFrequency(&freq);
@@ -62,17 +77,25 @@ void CheckCrystalClock() {
     unsigned __int64 rdtsc2 = __rdtsc();
     QueryPerformanceCounter(&t2);
 
-    double wallSecs = (double)(t2.QuadPart - t1.QuadPart) / freq.QuadPart;
-    double measured = (rdtsc2 - rdtsc1) / wallSecs;
-
-    // 5% tolerance (CPUs vary, thermal throttling, etc.)
-    double pctDiff = fabs(official - measured) / official;
-    bool mismatch = (pctDiff > 0.05);
+    double wallSecs = (double)(t2.QuadPart - t1.QuadPart) / (double)freq.QuadPart;
+    double measured_hz = (double)(rdtsc2 - rdtsc1) / wallSecs;
 
     char msg[128];
-    sprintf_s(msg, "official: %.0f | measured: %.0f | %.1f%% diff",
-        official / 1e6, measured / 1e6, pctDiff * 100);
-    Log("CPUID.0x15", msg, mismatch);
+
+    if (official_hz > 0.0) {
+        double pctDiff = fabs(official_hz - measured_hz) / official_hz;
+        bool mismatch = (pctDiff > 0.05); // 5% tolerance
+
+        sprintf_s(msg, "official: %.0f | measured: %.0f | %.1f%% diff",
+            official_hz / 1e6, measured_hz / 1e6, pctDiff * 100.0);
+
+        Log("CPUID.0x15/0x16", msg, mismatch);
+    }
+    else {
+        // no official reference; just print measured TSC freq and mark as success
+        sprintf_s(msg, "measured: %.0f MHz (no CPUID freq info)", measured_hz / 1e6);
+        Log("TSC (measured only)", msg, false);
+    }
 }
 
 void CheckKUserSharedData() {
