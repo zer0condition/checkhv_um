@@ -1,0 +1,141 @@
+﻿#include <windows.h>
+#include <iostream>
+#include <intrin.h>
+#include <iomanip>
+#include <chrono>
+
+void Log(const char* label, const char* msg, bool detected) {
+    HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
+    std::cout << "[";
+    if (detected) {
+        SetConsoleTextAttribute(hConsole, FOREGROUND_RED | FOREGROUND_INTENSITY);
+        std::cout << "failed";
+    }
+    else {
+        SetConsoleTextAttribute(hConsole, FOREGROUND_GREEN | FOREGROUND_INTENSITY);
+        std::cout << "success";
+    }
+    SetConsoleTextAttribute(hConsole, FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE);
+    std::cout << "] " << std::left << std::setw(25) << label << ": " << msg << std::endl;
+}
+
+void CheckSyntheticCPUID() {
+    int cpuInfo[4] = { 0 };
+    __cpuid(cpuInfo, 0x40000000);
+
+    // only flag if it returns a valid hypervisor vendor string
+    char vendor[13] = { 0 };
+    memcpy(vendor, &cpuInfo[1], 4);
+    memcpy(vendor + 4, &cpuInfo[2], 4);
+    memcpy(vendor + 8, &cpuInfo[3], 4);
+
+    bool isHypervisor = (cpuInfo[0] >= 0x40000000) &&
+        (strcmp(vendor, "Microsoft Hv") == 0 ||
+            strcmp(vendor, "VMwareVMware") == 0 ||
+            strcmp(vendor, "KVMKVMKVM") == 0 ||
+            strcmp(vendor, "XenVMMXenVMM") == 0);
+
+    char msg[128];
+    sprintf_s(msg, "eax=0x%08X vendor=%s", cpuInfo[0], vendor);
+    Log("synthetic CPUID", msg, isHypervisor);
+}
+
+void CheckCrystalClock() {
+    int cpuInfo[4] = { 0 };
+    __cpuid(cpuInfo, 0x15);
+
+    // many intel CPUs return partial info or require Leaf 0x16
+    if (cpuInfo[2] == 0) {
+        Log("CPUID.0x15", "no crystal freq (normal on many Intel CPUs)", false);
+        return;
+    }
+
+    unsigned long long denom = cpuInfo[0] ? cpuInfo[0] : 1;
+    double official = (double)cpuInfo[2] * cpuInfo[1] / denom;
+
+    LARGE_INTEGER freq, t1, t2;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&t1);
+
+    unsigned __int64 rdtsc1 = __rdtsc();
+    Sleep(100);  // short interval reduces noise
+    unsigned __int64 rdtsc2 = __rdtsc();
+    QueryPerformanceCounter(&t2);
+
+    double wallSecs = (double)(t2.QuadPart - t1.QuadPart) / freq.QuadPart;
+    double measured = (rdtsc2 - rdtsc1) / wallSecs;
+
+    // 5% tolerance (CPUs vary, thermal throttling, etc.)
+    double pctDiff = fabs(official - measured) / official;
+    bool mismatch = (pctDiff > 0.05);
+
+    char msg[128];
+    sprintf_s(msg, "official: %.0f | measured: %.0f | %.1f%% diff",
+        official / 1e6, measured / 1e6, pctDiff * 100);
+    Log("CPUID.0x15", msg, mismatch);
+}
+
+void CheckKUserSharedData() {
+    volatile DWORD* low = (DWORD*)0x7FFE0008;
+    volatile DWORD* high = (DWORD*)0x7FFE000C;
+
+    ULONGLONG tsc1 = __rdtsc();
+    ULONGLONG k1 = ((ULONGLONG)*high << 32) | *low;
+
+    Sleep(1000);
+
+    ULONGLONG tsc2 = __rdtsc();
+    ULONGLONG k2 = ((ULONGLONG)*high << 32) | *low;
+
+    ULONGLONG kDelta = k2 - k1;  // should be ~10M for 1s
+    bool skew = (kDelta < 9000000LL || kDelta > 11000000LL);
+
+    char msg[64];
+    sprintf_s(msg, "delta: %llu (10M expected)", kDelta);
+    Log("KUSER_SHARED_DATA", msg, skew);
+}
+
+void CheckUMIP_SGDT() {
+    // 8829 cycles = normal windows emulation 
+    // baremetal w/ UMIP ON: kernel emulates -> 5k-15k cycles typical
+    unsigned char gdtr[10] = { 0 };
+    ULONGLONG t1 = __rdtsc();
+    _sgdt(gdtr);
+    ULONGLONG t2 = __rdtsc();
+
+    ULONGLONG cycles = t2 - t1;
+    ULONGLONG base = *(ULONGLONG*)(gdtr + 2);
+
+    bool suspicious = (cycles < 1000);  // only flag raw hardware execution
+
+    char msg[64];
+    sprintf_s(msg, "cycles: %llu | base: 0x%llx", cycles, base);
+    Log("SGDT/UMIP", msg, suspicious);
+}
+
+void CheckTSX() {
+    int info[4];
+    __cpuidex(info, 7, 0);
+
+    if (!(info[1] & (1 << 11))) {
+        Log("TSX/RTM", "disabled by Intel microcode (normal post-2021)", false);
+        return;
+    }
+
+    // mhm
+    Log("TSX/RTM", "RTM supported", false);
+}
+
+int main() {
+    SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
+
+    CheckSyntheticCPUID();
+    CheckCrystalClock();
+    CheckKUserSharedData();
+    CheckUMIP_SGDT();
+    CheckTSX();
+
+    std::cout << "\press any key to exit.\n";
+    std::cin.get();
+    return 0;
+}
